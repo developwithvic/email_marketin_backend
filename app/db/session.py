@@ -22,6 +22,10 @@ if "sqlite" in db_url:
 else:
     engine_kwargs["pool_size"] = 10
     engine_kwargs["max_overflow"] = 2
+    engine_kwargs["connect_args"] = {
+        "statement_cache_size": 0,
+        "prepared_statement_cache_size": 0
+    }
 
 engine = create_async_engine(
     url=db_url,
