@@ -26,6 +26,14 @@ async def scrape(request: BulkScrapeRequest):
                 detail="URL list cannot be empty"
             )
 
+        # Block concurrent scrapes
+        is_active, active_task_id = scrape_task_manager.has_active_task()
+        if is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A scrape task is already in progress (task_id: {active_task_id}). Wait for it to complete or cancel it."
+            )
+
         task_info = scrape_task_manager.create_bulk_scrape_task(request.urls)
         return {
             "task_id": task_info["task_id"],
@@ -72,6 +80,14 @@ async def scrape_to_db(request: ScrapeToDBRequest):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Domain limit cannot exceed 10000"
+            )
+
+        # Block concurrent scrapes
+        is_active, active_task_id = scrape_task_manager.has_active_task()
+        if is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A scrape task is already in progress (task_id: {active_task_id}). Wait for it to complete or cancel it."
             )
 
         task_info = scrape_task_manager.create_scrape_to_db_task(

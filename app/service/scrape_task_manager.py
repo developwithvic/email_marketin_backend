@@ -228,6 +228,13 @@ class ScrapeTaskManager:
             task_info["error"] = str(err)
             task_info["completed_at"] = datetime.now(timezone.utc).isoformat()
 
+    def has_active_task(self) -> tuple[bool, Optional[str]]:
+        """Check if any scrape task is currently running or pending."""
+        for task_id, task_info in self.tasks.items():
+            if task_info["status"] in ("running", "pending"):
+                return True, task_id
+        return False, None
+
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         return self.tasks.get(task_id)
 
