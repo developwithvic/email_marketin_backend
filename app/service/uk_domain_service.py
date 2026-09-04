@@ -118,7 +118,10 @@ def _generate_synthetic_uk_domains() -> List[str]:
         'belfast', 'southampton', 'oxford', 'cambridge', 'york', 'bath', 'norwich',
         'exeter', 'plymouth', 'derby', 'leicester', 'aberdeen', 'dundee', 'coventry',
         'reading', 'brighton', 'luton', 'miltonkeynes', 'northampton', 'portsmouth',
-        'swindon', 'bournemouth', 'slough', 'chelmsford', 'gloucester', 'cheltenham'
+        'swindon', 'bournemouth', 'slough', 'chelmsford', 'gloucester', 'cheltenham',
+        'ipswich', 'colchester', 'bolton', 'stockport', 'preston', 'sunderland',
+        'doncaster', 'huddersfield', 'swansea', 'newport', 'wrexham', 'stirling',
+        'inverness', 'perth', 'sthelens', 'blackpool', 'warrington', 'solihull'
     ]
     services = [
         'plumbing', 'roofing', 'electrical', 'accountants', 'solicitors', 'legal',
@@ -126,28 +129,62 @@ def _generate_synthetic_uk_domains() -> List[str]:
         'cleaning', 'logistics', 'transport', 'design', 'marketing', 'digital',
         'consulting', 'recruitment', 'caterers', 'auto', 'garage', 'security',
         'finance', 'vet', 'tech', 'solutions', 'services', 'group', 'direct',
-        'media', 'studios', 'hvac', 'glazing', 'interiors', 'renovations'
+        'media', 'studios', 'hvac', 'glazing', 'interiors', 'renovations',
+        'scaffolding', 'surveyors', 'mortgages', 'printing', 'web', 'it',
+        'fitness', 'events', 'weddings', 'photography', 'care', 'nursing',
+        'taxis', 'removals', 'pestcontrol', 'doubleglazing', 'locksmith',
+        'engineering', 'architecture', 'landscape', 'joinery', 'joiners',
+        'plastering', 'groundworks', 'driveways', 'solar', 'energy'
     ]
+    modifiers = ['', '-services', '-uk', '-ltd', '247', '-group', '-direct']
+    tlds = ['.co.uk', '.uk']
+
     generated = []
     for c in cities:
         for s in services:
-            generated.append(f"{c}{s}.co.uk")
-            generated.append(f"{c}-{s}.co.uk")
-            generated.append(f"{c}{s}.uk")
+            for m in modifiers:
+                for tld in tlds:
+                    generated.append(f"{c}-{s}{m}{tld}")
+                    generated.append(f"{c}{s}{m}{tld}")
     return generated
 
 
+import socket
+socket.setdefaulttimeout(2.0)
+
 def _apply_cdx_patch():
-    """Patches cdx_toolkit to gracefully handle malformed JSON lines and non-200 responses."""
+    """Patches cdx_toolkit & requests to gracefully handle malformed JSON lines, non-200 responses, and enforce fast 2s network timeouts."""
     try:
         import cdx_toolkit
+        import cdx_toolkit.myrequests
+        import requests
         from cdx_toolkit import CaptureObject
 
         if getattr(cdx_toolkit, '_safe_patch_applied', False):
             return
 
-        orig_cdx_to_captures = cdx_toolkit.cdx_to_captures
+        # 1. Enforce strict 2s HTTP timeout on all requests Sessions
+        orig_session_send = requests.Session.send
+        def safe_session_send(self, request, **kwargs):
+            if kwargs.get('timeout') is None or kwargs.get('timeout') == (30.0, 30.0):
+                kwargs['timeout'] = (2.0, 2.0)
+            return orig_session_send(self, request, **kwargs)
+        requests.Session.send = safe_session_send
 
+        # 2. Fast Network Error Retry Patch
+        orig_myrequests_get = cdx_toolkit.myrequests.myrequests_get
+        def safe_myrequests_get(url, **kwargs):
+            kwargs['raise_error_after_n_errors'] = 1
+            kwargs['retry_max_sec'] = 1
+            kwargs['timeout'] = (2.0, 2.0)
+            return orig_myrequests_get(url, **kwargs)
+
+        cdx_toolkit.myrequests.myrequests_get = safe_myrequests_get
+        if hasattr(cdx_toolkit, 'myrequests_get'):
+            cdx_toolkit.myrequests_get = safe_myrequests_get
+
+        # 2. JSON Stream Line & Non-200 Response Patch
+        orig_cdx_to_captures = cdx_toolkit.cdx_to_captures
         def safe_cdx_to_captures(resp, wb=None, warc_download_prefix=None):
             # Ignore non-200 responses (e.g. 503 HTML error pages)
             if getattr(resp, 'status_code', 200) != 200:
@@ -174,84 +211,97 @@ def _apply_cdx_patch():
     except Exception as patch_err:
         logger.debug(f"Could not patch cdx_toolkit: {patch_err}")
 
+# Apply safety patch on module import
+_apply_cdx_patch()
+
+
+import concurrent.futures
+
+def _fetch_cdx_records(target_new_domains: int, records_to_skip: int, known_domains: Set[str]) -> tuple[Set[str], int]:
+    """Helper to query CDX API safely inside a worker thread."""
+    _apply_cdx_patch()
+    import cdx_toolkit
+
+    cdx = cdx_toolkit.CDXFetcher(source='cc')
+    results = cdx.iter("*.uk/*", filter=['=status:200', '=mime:text/html'])
+    results_iter = iter(results)
+
+    lines_per_page = getattr(cdx_toolkit, 'lines_per_page', 3000)
+    start_page = records_to_skip // lines_per_page
+    current_record_index = 0
+
+    if start_page > 0 and hasattr(results_iter, 'page'):
+        results_iter.page = start_page - 1
+        results_iter.captures = []
+        current_record_index = start_page * lines_per_page
+
+    discovered = set()
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+
+    while len(discovered) < target_new_domains and consecutive_errors < max_consecutive_errors:
+        current_record_index += 1
+        try:
+            obj = next(results_iter)
+            consecutive_errors = 0
+        except StopIteration:
+            break
+        except Exception as item_err:
+            consecutive_errors += 1
+            logger.debug(f"Skipping malformed CDX item ({consecutive_errors}/{max_consecutive_errors}): {item_err}")
+            continue
+
+        if current_record_index <= records_to_skip:
+            continue
+
+        try:
+            url = obj.data.get('url') if hasattr(obj, 'data') and isinstance(obj.data, dict) else None
+            if url:
+                domain = urlparse(url).netloc
+                if domain.startswith('www.'):
+                    domain = domain[4:]
+
+                if domain and domain not in known_domains and domain not in discovered:
+                    discovered.add(domain)
+                    print(f"  [+] Discovered new target from CDX: {domain}")
+                    if len(discovered) >= target_new_domains:
+                        break
+        except Exception as item_parse_err:
+            logger.debug(f"Skipping malformed CDX domain item: {item_parse_err}")
+            continue
+
+    return discovered, current_record_index
+
 
 def discover_uk_domains(target_new_domains: int = 20) -> List[str]:
     """
     Resumes from the last known position and fetches N entirely new domains.
-    Includes error resilience for CDX API failures, malformed JSON stream lines,
-    timeout protection, and multi-tiered fallback pool (CSV list + curated top domains + sector domain generator).
+    Includes error resilience for CDX API failures, thread-safe 3s timeout protection,
+    and a multi-tiered fallback pool (CSV list + curated top domains + 100k+ sector domain generator).
     """
     records_to_skip = _load_resume_index()
     known_domains = _load_known_domains()
     new_domains = set()
-    current_record_index = 0
+    current_record_index = records_to_skip
 
     print(f"\n📚 Resuming discovery... Fast-forwarding past {records_to_skip} old records.")
 
-    # Apply safety patch to cdx_toolkit before iterating
-    _apply_cdx_patch()
-
-    # 1. Attempt CDX API Discovery with timeout protection & item-level error handling
+    # 1. Attempt CDX API Discovery inside ThreadPoolExecutor with strict 3s timeout
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        import signal
-
-        def cdx_timeout_handler(signum, frame):
-            raise TimeoutError("CDX API request timed out (5s limit reached)")
-
-        # Enable SIGALRM timeout for CDX network fetch (Linux)
-        if hasattr(signal, 'SIGALRM'):
-            signal.signal(signal.SIGALRM, cdx_timeout_handler)
-            signal.alarm(5)
-
-        import cdx_toolkit
-        cdx = cdx_toolkit.CDXFetcher(source='cc')
-        results = cdx.iter("*.uk/*", filter=['=status:200', '=mime:text/html'])
-        results_iter = iter(results)
-
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-
-        while len(new_domains) < target_new_domains and consecutive_errors < max_consecutive_errors:
-            current_record_index += 1
-
-            try:
-                obj = next(results_iter)
-                consecutive_errors = 0
-            except StopIteration:
-                break
-            except Exception as item_err:
-                consecutive_errors += 1
-                logger.debug(f"Skipping malformed CDX item ({consecutive_errors}/{max_consecutive_errors}): {item_err}")
-                continue
-
-            # FAST FORWARD: Skip records processed in previous runs
-            if current_record_index <= records_to_skip:
-                continue
-
-            try:
-                url = obj.data.get('url') if hasattr(obj, 'data') and isinstance(obj.data, dict) else None
-                if url:
-                    domain = urlparse(url).netloc
-                    if domain.startswith('www.'):
-                        domain = domain[4:]
-
-                    if domain and domain not in known_domains and domain not in new_domains:
-                        new_domains.add(domain)
-                        print(f"  [+] Discovered new target from CDX: {domain}")
-
-                        if len(new_domains) >= target_new_domains:
-                            break
-            except Exception as item_parse_err:
-                logger.debug(f"Skipping malformed CDX domain item: {item_parse_err}")
-                continue
-
+        future = executor.submit(_fetch_cdx_records, target_new_domains, records_to_skip, known_domains)
+        cdx_discovered, cdx_last_index = future.result(timeout=3.0)
+        new_domains.update(cdx_discovered)
+        if cdx_last_index > records_to_skip:
+            current_record_index = cdx_last_index
     except Exception as e:
-        print(f"⚠️ CDX API Error encountered: {e}. Switching to UK Domain Fallback Pool.")
+        print(f"⚠️ CDX API Error/Timeout encountered: {e}. Switching to UK Domain Fallback Pool.")
         logger.warning(f"CDX API Error: {e}")
     finally:
-        # Disable SIGALRM timeout
-        if hasattr(signal, 'SIGALRM'):
-            signal.alarm(0)
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     # Fallback Tier 1: Local CSV list (my_uk_list.csv)
     if len(new_domains) < target_new_domains:
@@ -273,7 +323,7 @@ def discover_uk_domains(target_new_domains: int = 20) -> List[str]:
                 if len(new_domains) >= target_new_domains:
                     break
 
-    # Fallback Tier 3: Sector business domain generator (for large target limits up to 10,000)
+    # Fallback Tier 3: High-yield sector business domain generator (over 100,000 UK domain patterns)
     if len(new_domains) < target_new_domains:
         synthetic_domains = _generate_synthetic_uk_domains()
         for fallback in synthetic_domains:
@@ -286,8 +336,7 @@ def discover_uk_domains(target_new_domains: int = 20) -> List[str]:
         print(f"🔄 Supplemented discovery with fallback pool! Yielded {len(new_domains)} domains out of {target_new_domains} requested.")
 
     # Save state
-    total_records_processed = records_to_skip + max(0, current_record_index - records_to_skip)
-    _save_resume_index(total_records_processed)
+    _save_resume_index(current_record_index)
     _save_known_domains(new_domains)
 
     return list(new_domains)
